@@ -1,36 +1,16 @@
 import os, logging
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/pacheck")
-
-def get_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        yield conn
-    finally:
-        conn.close()
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 app = FastAPI(title="PACheck API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
-
-def db_row_to_dict(cur):
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 @app.get("/health")
 def health():
@@ -42,7 +22,6 @@ def lookup(
     payer:     Optional[str] = Query(None),
     plan_type: Optional[str] = Query(None),
     state:     Optional[str] = Query(None),
-    db = Depends(get_db),
 ):
     cpt_codes   = [c.strip().upper() for c in cpt.split(",") if c.strip()]
     payer_slugs = [p.strip().lower() for p in payer.split(",")] if payer else []
@@ -70,8 +49,7 @@ def lookup(
                p.portal_url AS payer_portal,
                pt.slug AS plan_type, pt.label AS plan_label,
                r.state, r.status, r.notes, r.turnaround_days,
-               r.submission_portal, r.confidence, r.source_type,
-               r.updated_at, r.scraped_at
+               r.submission_portal, r.updated_at
         FROM pa_rules r
         JOIN cpt_codes  c  ON c.id  = r.cpt_id
         JOIN payers     p  ON p.id  = r.payer_id
@@ -79,9 +57,10 @@ def lookup(
         WHERE {where}
         ORDER BY c.code, p.slug, pt.slug
     """
-    with db.cursor() as cur:
-        cur.execute(sql, params)
-        rows = db_row_to_dict(cur)
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
 
     grouped = {}
     for r in rows:
@@ -108,38 +87,43 @@ def lookup(
                      "queryTime": datetime.now(timezone.utc).isoformat()}}
 
 @app.get("/search")
-def search_cpt(q: str = Query(..., min_length=2), limit: int = Query(20), db = Depends(get_db)):
-    sql = "SELECT code, description, specialty, category FROM cpt_codes WHERE code ILIKE %s OR description ILIKE %s AND is_active = true ORDER BY code LIMIT %s"
-    with db.cursor() as cur:
-        cur.execute(sql, (f"{q}%", f"%{q}%", limit))
-        rows = db_row_to_dict(cur)
+def search_cpt(q: str = Query(..., min_length=2), limit: int = Query(20)):
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT code, description, specialty, category FROM cpt_codes WHERE code ILIKE %s OR description ILIKE %s AND is_active = true ORDER BY code LIMIT %s",
+                (f"{q}%", f"%{q}%", limit)
+            )
+            rows = cur.fetchall()
     return {"results": rows}
 
 @app.get("/stats")
-def stats(db = Depends(get_db)):
-    with db.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM cpt_codes WHERE is_active = true")
-        total_codes = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM pa_rules WHERE is_active = true")
-        total_rules = cur.fetchone()[0]
-        cur.execute("SELECT MAX(scraped_at) FROM pa_rules")
-        last_updated = cur.fetchone()[0]
+def stats():
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM cpt_codes WHERE is_active = true")
+            total_codes = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) AS total FROM pa_rules WHERE is_active = true")
+            total_rules = cur.fetchone()["total"]
+            cur.execute("SELECT MAX(scraped_at) AS last FROM pa_rules")
+            last_updated = cur.fetchone()["last"]
     return {"totalCptCodes": total_codes, "totalRules": total_rules,
             "lastUpdated": last_updated.isoformat() if last_updated else None}
 
 @app.get("/recent-changes")
-def recent_changes(days: int = Query(7), db = Depends(get_db)):
-    with db.cursor() as cur:
-        cur.execute("""
-            SELECT c.code, c.description, p.short_name AS payer,
-                   pt.label AS plan_type, ch.old_status, ch.new_status, ch.changed_at
-            FROM pa_rule_changelog ch
-            JOIN pa_rules    r  ON r.id  = ch.pa_rule_id
-            JOIN cpt_codes   c  ON c.id  = r.cpt_id
-            JOIN payers      p  ON p.id  = r.payer_id
-            JOIN plan_types  pt ON pt.id = r.plan_type_id
-            WHERE ch.changed_at >= NOW() - (%s || ' days')::INTERVAL
-            ORDER BY ch.changed_at DESC LIMIT 200
-        """, (days,))
-        rows = db_row_to_dict(cur)
+def recent_changes(days: int = Query(7)):
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.code, c.description, p.short_name AS payer,
+                       pt.label AS plan_type, ch.old_status, ch.new_status, ch.changed_at
+                FROM pa_rule_changelog ch
+                JOIN pa_rules    r  ON r.id  = ch.pa_rule_id
+                JOIN cpt_codes   c  ON c.id  = r.cpt_id
+                JOIN payers      p  ON p.id  = r.payer_id
+                JOIN plan_types  pt ON pt.id = r.plan_type_id
+                WHERE ch.changed_at >= NOW() - (%s || ' days')::INTERVAL
+                ORDER BY ch.changed_at DESC LIMIT 200
+            """, (str(days),))
+            rows = cur.fetchall()
     return {"changes": rows, "days": days}
